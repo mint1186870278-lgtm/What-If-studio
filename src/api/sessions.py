@@ -11,7 +11,14 @@ from sqlalchemy.orm import Session as DBSession
 from src.db import get_db
 from src.models import Project, Session, VideoJob
 from src.schemas import SessionCreate, SessionResponse, DiscussionTurn
-from src.agents import run_autogen_discussion_stream
+
+# Prefer LangGraph; fall back to AutoGen
+try:
+    from src.agents import run_langgraph_discussion_stream as _discuss_stream
+    _BACKEND = "langgraph"
+except Exception:
+    from src.agents import run_autogen_discussion_stream as _discuss_stream  # type: ignore[assignment]
+    _BACKEND = "autogen"
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +95,7 @@ async def generate_discussion_stream(
         turns = []
         script = ""
 
-        async for event in run_autogen_discussion_stream(
+        async for event in _discuss_stream(
             user_request=session.prompt,
             style=session.style_preference,
         ):
@@ -99,7 +106,7 @@ async def generate_discussion_stream(
                 script = str(event.get("script", ""))
 
         if not script.strip():
-            raise RuntimeError("AutoGen completed without a valid script.")
+            raise RuntimeError("Discussion completed without a valid script.")
         session.script = script
         session.discussion_history = turns
         session.status = "completed"

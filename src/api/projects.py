@@ -13,7 +13,12 @@ from sqlalchemy.orm import Session
 from src.db import get_db
 from src.models import Project, Asset, Session as DBSession, VideoJob
 from src.schemas import ProjectCreate, ProjectUpdate, ProjectResponse
-from src.agents import run_autogen_discussion_stream
+
+# Prefer LangGraph; fall back to AutoGen
+try:
+    from src.agents import run_langgraph_discussion_stream as _discuss_stream
+except Exception:
+    from src.agents import run_autogen_discussion_stream as _discuss_stream  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +172,7 @@ async def _generate_project_discussion_stream(project: Project, db: Session):
     yield f"data: {json.dumps({'type': 'system', 'content': 'discussion_started'}, ensure_ascii=False)}\n\n"
     try:
         user_request = f"{project.name}：{project.prompt or ''}" if project.name else (project.prompt or "")
-        async for event in run_autogen_discussion_stream(
+        async for event in _discuss_stream(
             user_request=user_request,
             style=project.style_preference or "auto",
         ):

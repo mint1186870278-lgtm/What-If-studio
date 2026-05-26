@@ -38,8 +38,10 @@ class Settings(BaseSettings):
     cors_origins: list[str] = [
         "http://localhost:3000",
         "http://localhost:5173",
+        "http://localhost:5180",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
+        "http://127.0.0.1:5180",
     ]
 
     # Server
@@ -74,6 +76,16 @@ class Settings(BaseSettings):
     wan_base_url: str = os.getenv("WAN_BASE_URL", "")
     seedance_api_key: str = os.getenv("SEEDANCE_API_KEY", "")
     seedance_api_url: str = os.getenv("SEEDANCE_API_URL", "http://localhost:8000")
+    # Local video model (Wan2.1-VACE-14B or similar)
+    local_video_model_path: str = os.getenv("LOCAL_VIDEO_MODEL_PATH", "")
+    local_video_model_name: str = os.getenv("LOCAL_VIDEO_MODEL_NAME", "Wan-AI/Wan2.1-VACE-14B")
+
+    # OpenAI-Next API (video generation & editing)
+    openai_next_api_key: str = os.getenv("OPENAI_NEXT_API_KEY", "")
+    openai_next_base_url: str = os.getenv("OPENAI_NEXT_BASE_URL", "https://draw.openai-next.com")
+    openai_next_video_model: str = os.getenv("OPENAI_NEXT_VIDEO_MODEL", "wan2.7-videoedit")
+    # Public HTTPS base URL for serving video assets to external APIs
+    public_base_url: str = os.getenv("PUBLIC_BASE_URL", "")
 
     # Memory
     mem0_api_key: str = os.getenv("MEM0_API_KEY", "")

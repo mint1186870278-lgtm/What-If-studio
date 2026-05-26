@@ -56,3 +56,5 @@ tmp-artifacts
 # Web build outputs
 web/node_modules/
 web/dist/
+
+storage/

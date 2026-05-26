@@ -68,6 +68,7 @@ async def process_video_job_background(
         # Stage 5: Render
         job.phase = "render"
         db.commit()
+        print("[VIDEO] RENDER STAGE v2026-05-22-fixed", flush=True)
 
         # Create output path and generate video
         output_dir = settings.storage_projects_path / str(session.project_id) / "outputs"
@@ -75,7 +76,7 @@ async def process_video_job_background(
         output_path = str(output_dir / f"{job_id}.mp4")
 
         try:
-            from src.core.video_pipeline import generate_video_from_script
+            # Build video prompt
             work_title = (session.project.name or "") if session.project else ""
             ending = (session.prompt or "").strip()
             if work_title and ending:
@@ -87,19 +88,63 @@ async def process_video_job_background(
             else:
                 video_prompt = "生成一段视频"
 
-            logger.info("📤 HappyHorse prompt: %s", video_prompt[:150])
-            actual_path = await generate_video_from_script(
-                session.script or "", output_path,
-                prompt_override=video_prompt,
-                video_url=video_url,
-                reference_image_urls=reference_image_urls,
-            )
+            # Route through model router (supports LOCAL/VACE, HappyHorse, Kling, Wan, ffmpeg)
+            from src.core.model_router import model_router, VideoProvider
+
+            available = model_router.video.get_available_providers()
+            print(f"[VIDEO] Available providers: {[p.value for p in available]}", flush=True)
+
+            # Auto-discover source video if none provided via query param
+            _source_video = video_url
+            if not _source_video:
+                from src.models import Asset as AssetModel
+                assets = db.query(AssetModel).filter(
+                    AssetModel.project_id == session.project_id,
+                    AssetModel.file_type == "video",
+                ).order_by(AssetModel.created_at.desc()).all()
+                if assets:
+                    candidate = settings.storage_projects_path / assets[0].file_path
+                    print(f"[VIDEO] Checking asset path: {candidate}", flush=True)
+                    if candidate.exists():
+                        _source_video = str(candidate)
+                        print(f"[VIDEO] Found source video: {_source_video[:80]}", flush=True)
+                    else:
+                        print(f"[VIDEO] Asset path NOT FOUND: {candidate}", flush=True)
+                else:
+                    print("[VIDEO] No video assets found in project", flush=True)
+
+            # Doubao I2V — local frame extraction, base64 upload, ByteDance CDN download (no GFW)
+            actual_path = None
+
+            if VideoProvider.DOUBAO in available:
+                try:
+                    print(f"[VIDEO] 🎬 Trying Doubao I2V (local frame→base64→ByteDance CDN)...", flush=True)
+                    actual_path = await model_router.video.generate_video(
+                        prompt=video_prompt,
+                        provider=VideoProvider.DOUBAO,
+                        source_video_url=_source_video,
+                        output_path=output_path,
+                    )
+                    print(f"[VIDEO] ✅ Doubao output: {actual_path}", flush=True)
+                except Exception as e:
+                    import traceback
+                    print(f"[VIDEO] Doubao I2V failed: {e}", flush=True)
+                    traceback.print_exc()
+
+            if actual_path is None:
+                from src.core.video_pipeline import generate_video_from_script
+                print("[VIDEO] 📤 Using ffmpeg fallback", flush=True)
+                actual_path = await generate_video_from_script(
+                    session.script or "", output_path,
+                    prompt_override=video_prompt,
+                    video_url=video_url,
+                    reference_image_urls=reference_image_urls,
+                )
+                print(f"[VIDEO] Fallback output: {actual_path}", flush=True)
             job.output_path = actual_path
-            logger.info("✅ Video generated: %s", actual_path)
+            print(f"[VIDEO] Done: {actual_path}", flush=True)
         except Exception as render_err:
             logger.error("Video generation failed: %s", render_err)
-            # Still set output_path so the download endpoint can serve the file
-            # (generate_video_from_script writes a placeholder on failure)
             if not job.output_path:
                 job.output_path = output_path
 
