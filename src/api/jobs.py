@@ -65,10 +65,35 @@ async def process_video_job_background(
         db.commit()
         await asyncio.sleep(1)
 
+        # Stage 4.5: Storyboard (between edit and render)
+        job.phase = "storyboard"
+        db.commit()
+        await asyncio.sleep(1)
+
+        # Load or generate storyboard for this project
+        storyboard_data = None
+        if session.project:
+            storyboard_data = session.project.storyboard
+
+        if not storyboard_data:
+            try:
+                from src.core.model_router import model_router, ModelProvider
+                print("[VIDEO] Generating storyboard from script...", flush=True)
+                storyboard_data = await model_router.video.generate_storyboard(
+                    session.script or "",
+                )
+                if session.project:
+                    session.project.storyboard = storyboard_data
+                    db.commit()
+                print(f"[VIDEO] Storyboard generated: {len(storyboard_data.get('frames', []))} frames", flush=True)
+            except Exception as sb_err:
+                print(f"[VIDEO] Storyboard generation skipped (no LLM available): {sb_err}", flush=True)
+                storyboard_data = None
+
         # Stage 5: Render
         job.phase = "render"
         db.commit()
-        print("[VIDEO] RENDER STAGE v2026-05-22-fixed", flush=True)
+        print("[VIDEO] RENDER STAGE v2026-05-26-storyboard", flush=True)
 
         # Create output path and generate video
         output_dir = settings.storage_projects_path / str(session.project_id) / "outputs"
@@ -76,7 +101,7 @@ async def process_video_job_background(
         output_path = str(output_dir / f"{job_id}.mp4")
 
         try:
-            # Build video prompt
+            # Build video prompt — incorporate storyboard frames if available
             work_title = (session.project.name or "") if session.project else ""
             ending = (session.prompt or "").strip()
             if work_title and ending:
@@ -87,6 +112,17 @@ async def process_video_job_background(
                 video_prompt = f"场景：{ending}"
             else:
                 video_prompt = "生成一段视频"
+
+            # Augment prompt with storyboard context
+            if storyboard_data and storyboard_data.get("frames"):
+                frame_descriptions = []
+                for i, f in enumerate(storyboard_data["frames"][:5], 1):
+                    desc = f.get("description", "")
+                    timing = f.get("timing", "")
+                    frame_descriptions.append(f"第{i}幕({timing}): {desc}")
+                sb_context = "\n".join(frame_descriptions)
+                video_prompt = f"{video_prompt}\n\n分镜参考：\n{sb_context}"
+                print(f"[VIDEO] Prompt augmented with {len(frame_descriptions)} storyboard frames", flush=True)
 
             # Route through model router (supports LOCAL/VACE, HappyHorse, Kling, Wan, ffmpeg)
             from src.core.model_router import model_router, VideoProvider
@@ -199,8 +235,9 @@ async def generate_video_progress_stream(
             ("collect", "正在收集素材...", 10),
             ("analyze", "正在分析视频...", 20),
             ("discuss", "正在应用讨论建议...", 30),
-            ("edit", "正在生成编辑脚本...", 50),
-            ("render", "正在调用生成模型...", 75),
+            ("edit", "正在生成编辑脚本...", 45),
+            ("storyboard", "正在生成分镜预览...", 60),
+            ("render", "正在调用生成模型...", 80),
             ("deliver", "正在保存视频...", 100),
         ]
 

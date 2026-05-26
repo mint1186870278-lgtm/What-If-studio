@@ -78,7 +78,7 @@ _PROVIDER_META: dict[ModelProvider, dict[str, str]] = {
         "base_env": "DEEPSEEK_BASE_URL",
         "model_env": "DEEPSEEK_MODEL",
         "default_base": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-v4-flash",
     },
     ModelProvider.SILICONFLOW: {
         "key_env": "SILICONFLOW_API_KEY",
@@ -348,7 +348,7 @@ class VideoModelRouter:
     async def generate_storyboard(
         self,
         script: str,
-        provider: ModelProvider = ModelProvider.OPENAI,
+        provider: ModelProvider | None = None,
         **kwargs,
     ) -> dict:
         """Generate a storyboard/preview from a script using a text LLM.
@@ -361,6 +361,10 @@ class VideoModelRouter:
             f"剧本：\n{script}\n\n"
             "请输出JSON格式，keys: frames (数组, 每项含description和timing), total_duration。只输出JSON，不要其他文字。"
         )
+        # Use specified provider or auto-detect the first available
+        if provider is None:
+            available = text_router.get_available_providers()
+            provider = available[0] if available else ModelProvider.OPENAI
         try:
             raw = await text_router.generate(
                 provider=provider,
@@ -369,8 +373,12 @@ class VideoModelRouter:
                 max_tokens=2048,
             )
         except ProviderNotAvailableError:
+            # Try any available provider
+            available = text_router.get_available_providers()
+            if not available:
+                raise
             raw = await text_router.generate(
-                provider=ModelProvider.OPENAI,
+                provider=available[0],
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=2048,

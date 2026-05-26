@@ -96,7 +96,62 @@ def _init_state(
         "user_intervention": None,
         "turn_count": 0,
         "memory_context": memory_context,
+        "_user_just_intervened": False,
+        "_checkin_done": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Real-time user intervention helpers (WebSocket-driven)
+# ---------------------------------------------------------------------------
+
+async def _check_user_intervention(session_id: str) -> str | None:
+    """Check if user has requested intervention via WebSocket.
+
+    Returns the user's text if an intervention flag is set, or None.
+    Clears the flag so it is only consumed once.
+    """
+    if not session_id:
+        return None
+    try:
+        from src.api.ws import intervention_flags, intervention_texts
+        flag = intervention_flags.get(session_id)
+        if flag and flag.is_set():
+            text = intervention_texts.pop(session_id, None)
+            intervention_flags.pop(session_id, None)
+            return text
+    except Exception:
+        pass
+    return None
+
+
+async def _warm_memory_async(user_id: str, user_request: str) -> None:
+    """Fetch memory context in background to warm cache for next session."""
+    try:
+        from src.core.memory_service import memory_service
+        await memory_service.build_context_for_new_session(user_id, user_request)
+        logger.debug("Background memory warm completed for %s", user_id)
+    except Exception:
+        pass
+
+
+async def _check_pause(session_id: str) -> None:
+    """Wait if the discussion has been paused via WebSocket.
+
+    Blocks until a resume_now or intervene action is received.
+    """
+    if not session_id:
+        return
+    try:
+        from src.api.ws import pause_events
+        evt = pause_events.get(session_id)
+        if evt is not None:
+            logger.info("Discussion paused for session %s, waiting...", session_id)
+            await evt.wait()
+            pause_events.pop(session_id, None)
+            logger.info("Discussion resumed for session %s", session_id)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +264,43 @@ def _build_director_node(role: str, agent_id: str) -> callable:
         name = _agent_label(agent_map, agent_id, role)
         system_prompt = DIRECTOR_PROMPTS.get(role, DIRECTOR_PROMPTS["narrative"])
         queue = _stream_queue  # module-level, not in state (avoids msgpack error)
+        sid = str(state.get("session_id", ""))
+
+        # 1. Check for pause (block until resumed)
+        await _check_pause(sid)
+
+        # 2. Check for real-time user intervention
+        intervention_text = await _check_user_intervention(sid)
+        if intervention_text:
+            state["user_intervention"] = intervention_text
+            state["_user_just_intervened"] = True
+            if queue is not None:
+                await queue.put({
+                    "type": "user_intervention",
+                    "speaker": "user",
+                    "role": "user",
+                    "content": intervention_text,
+                    "stage": "debate",
+                    "ts": int(asyncio.get_running_loop().time() * 1000),
+                })
 
         llm = _get_llm()
 
         # Build conversation context
-        context_parts = [f"用户需求：{state['user_request']}", f"风格：{state['style']}"]
+        context_parts = []
+        # User intervention takes TOP priority — MUST address it first
+        user_intv = state.get("user_intervention")
+        if user_intv:
+            context_parts.append(
+                f"【重要】用户刚刚直接向你提出了意见，你必须首先回应这个意见：\n"
+                f"「{user_intv}」\n"
+                f"请先针对这个意见给出你的看法，然后再继续你的本职工作。"
+            )
+            state["user_intervention"] = None
+        context_parts.append(f"用户需求：{state['user_request']}")
+        context_parts.append(f"风格：{state['style']}")
         if state.get("memory_context"):
             context_parts.append(f"用户历史偏好：{state['memory_context']}")
-        if state.get("user_intervention"):
-            context_parts.append(f"用户介入意见：{state['user_intervention']}")
-            state["user_intervention"] = None
 
         # Include previous turns
         prev_msgs = state.get("messages", [])
@@ -293,26 +375,28 @@ _MAX_ROUNDS = 3  # each director speaks this many times before critic
 
 async def _round_check_node(state: dict[str, Any]) -> dict[str, Any]:
     """Check discussion progress: detect disagreement, count rounds, decide next step."""
+    # If user just intervened, skip disagreement detection so we don't
+    # immediately ask the user for MORE input.
+    if state.get("_user_just_intervened"):
+        state["_user_just_intervened"] = False
+        state["disagreement_count"] = 0
+
     msgs = state.get("messages", [])
     state["round_count"] = state.get("round_count", 0) + 1
 
-    # Disagreement detection
-    if len(msgs) >= 2:
-        recent = msgs[-4:]
-        disagreement_signals = 0
-        for m in recent:
-            content = str(m.get("content", ""))
-            if any(kw in content for kw in ["不同意", "反对", "但是", "然而", "我认为应该", "不建议"]):
-                disagreement_signals += 1
-        if disagreement_signals >= 3 and state.get("disagreement_count", 0) < 2:
-            state["disagreement_count"] = state.get("disagreement_count", 0) + 1
-            state["pending_user_question"] = (
-                "导演们对创作方向存在不同意见。"
-                f"当前讨论焦点：{recent[-1].get('content', '')[:150]}\n"
-                "请问你倾向于哪种方向？输入你的意见，或输入'继续'让导演们自行决定。"
-            )
-            state["phase"] = "awaiting_user"
-            return state
+    # --- Periodic user check-in (once per discussion) ---
+    # Ask user for feedback after round 2 to keep them engaged.
+    if state.get("round_count", 0) == 2 and not state.get("_checkin_done"):
+        state["_checkin_done"] = True
+        recent_msgs = [str(m.get("content", ""))[:100] for m in msgs[-4:]]
+        state["pending_user_question"] = (
+            "导演组已完成第一轮讨论，现在想听听你的意见。\n"
+            + "\n".join(f"· {s}" for s in recent_msgs if s)
+            + "\n\n你对目前的方向满意吗？有什么想调整的吗？\n"
+            "输入你的想法，或发送「继续」让导演组继续。"
+        )
+        state["phase"] = "awaiting_user"
+        return state
 
     # Determine next step
     if state.get("round_count", 0) >= _MAX_ROUNDS:
@@ -348,6 +432,25 @@ async def _critic_node(state: dict[str, Any]) -> dict[str, Any]:
     name = _agent_label(agent_map, agent_id, "Critic")
     system_prompt = DIRECTOR_PROMPTS["critic"]
     queue = _stream_queue  # module-level, not in state (avoids msgpack error)
+    sid = str(state.get("session_id", ""))
+
+    # 1. Check for pause (block until resumed)
+    await _check_pause(sid)
+
+    # 2. Check for real-time user intervention
+    intervention_text = await _check_user_intervention(sid)
+    if intervention_text:
+        state["user_intervention"] = intervention_text
+        state["_user_just_intervened"] = True
+        if queue is not None:
+            await queue.put({
+                "type": "user_intervention",
+                "speaker": "user",
+                "role": "user",
+                "content": intervention_text,
+                "stage": "finalize",
+                "ts": int(asyncio.get_running_loop().time() * 1000),
+            })
 
     cfg = _resolve_llm_config()
     llm = ChatOpenAI(
@@ -364,7 +467,18 @@ async def _critic_node(state: dict[str, Any]) -> dict[str, Any]:
         f"[{m.get('speaker', '')}]: {m.get('content', '')}" for m in prev_msgs
     )
 
+    # User intervention takes top priority
+    user_intv = state.get("user_intervention")
+    user_intv_block = ""
+    if user_intv:
+        user_intv_block = (
+            f"【重要】用户刚刚直接提出了意见，你必须优先考虑：\n"
+            f"「{user_intv}」\n\n"
+        )
+        state["user_intervention"] = None
+
     context = (
+        f"{user_intv_block}"
         f"用户需求：{state['user_request']}\n"
         f"风格：{state['style']}\n"
         f"讨论记录：\n{discussion_text}\n\n"
@@ -554,13 +668,33 @@ async def run_langgraph_discussion_stream(
     sid = session_id or str(uuid.uuid4())
     graph = build_discussion_graph()
 
-    # Inject memory context if available
+    # Inject memory context if available -- with a short timeout so Chroma
+    # model downloads don't block the discussion from starting.
+    prefs_count = 0
+    similar_count = 0
     if user_id and not memory_context:
         try:
             from src.core.memory_service import memory_service
-            memory_context = await memory_service.build_context_for_new_session(user_id, user_request)
-        except Exception as exc:
-            logger.debug("Memory context fetch skipped: %s", exc)
+            mem_info = await asyncio.wait_for(
+                memory_service.build_context_for_new_session(user_id, user_request),
+                timeout=3.0,
+            )
+            memory_context = mem_info.get("context", "") if isinstance(mem_info, dict) else str(mem_info)
+            prefs_count = mem_info.get("preferences_count", 0) if isinstance(mem_info, dict) else 0
+            similar_count = mem_info.get("similar_scripts", 0) if isinstance(mem_info, dict) else 0
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.debug("Memory context fetch skipped (%s), proceeding without it", exc)
+            # Retry in background for next session
+            if user_id:
+                asyncio.create_task(_warm_memory_async(user_id, user_request))
+
+    # Notify frontend when historical preferences are loaded
+    if memory_context:
+        yield {
+            "type": "memory_loaded",
+            "preferences_count": prefs_count,
+            "similar_scripts": similar_count,
+        }
 
     initial_state = _init_state(
         user_request=user_request,
@@ -579,20 +713,25 @@ async def run_langgraph_discussion_stream(
 
     graph_error: Exception | None = None
 
-    async def _run_graph() -> None:
+    async def _resume_after_pause(current_state: dict | None) -> None:
+        """Resume graph after user input, handling nested pauses recursively.
+
+        Passes the updated state dict (NOT None) to graph.astream so that
+        our changes are preserved.  graph.update_state REPLACES state for
+        plain-dict StateGraph, so we mutate a copy of the current state
+        and pass it directly.
+        """
         nonlocal graph_error
         try:
-            async for event in graph.astream(initial_state, config, stream_mode="values"):
+            async for event in graph.astream(current_state, config, stream_mode="values"):
                 if not isinstance(event, dict):
                     continue
-                # If graph paused for user input
                 if event.get("pending_user_question") and event.get("phase") == "awaiting_user":
                     await queue.put({
                         "type": "awaiting_input",
                         "question": event["pending_user_question"],
                         "session_id": sid,
                     })
-                    # Wait for user via WebSocket
                     try:
                         from src.api.ws import wait_for_user_input
                         user_input = await wait_for_user_input(
@@ -601,26 +740,49 @@ async def run_langgraph_discussion_stream(
                     except Exception:
                         user_input = None
 
+                    # Build a clean state dict to pass directly (avoid
+                    # update_state which replaces, not merges, for dict
+                    # StateGraph).
+                    next_state = dict(event)
+                    next_state["pending_user_question"] = None
                     if user_input and user_input.strip().lower() not in ("继续", "continue", "go on"):
-                        # Inject user input into the state and resume
-                        event["user_intervention"] = user_input
-                        event["pending_user_question"] = None
-                        _set_stream_queue(queue)
-                        async for _ in graph.astream(None, config, stream_mode="values"):
-                            pass  # nodes push events to queue themselves
+                        next_state["user_intervention"] = user_input
                     else:
-                        # Timeout or user chose to continue — push through
-                        event["pending_user_question"] = None
-                        event["phase"] = "discussion"
-                        _set_stream_queue(queue)
-                        async for _ in graph.astream(None, config, stream_mode="values"):
-                            pass
+                        next_state["phase"] = "discussion"
+                    _set_stream_queue(queue)
+                    await _resume_after_pause(next_state)
+        except Exception as exc:
+            logger.error("LangGraph discussion failed: %s", exc)
+            graph_error = exc
 
-                # Check for final output
-                if event.get("script") and event.get("phase") == "finalize":
-                    # Let queue drain naturally — the critic node already
-                    # pushed turn_chunk + script events to the queue
-                    pass
+    async def _run_graph() -> None:
+        nonlocal graph_error
+        try:
+            async for event in graph.astream(initial_state, config, stream_mode="values"):
+                if not isinstance(event, dict):
+                    continue
+                if event.get("pending_user_question") and event.get("phase") == "awaiting_user":
+                    await queue.put({
+                        "type": "awaiting_input",
+                        "question": event["pending_user_question"],
+                        "session_id": sid,
+                    })
+                    try:
+                        from src.api.ws import wait_for_user_input
+                        user_input = await wait_for_user_input(
+                            sid, event["pending_user_question"], timeout=120.0,
+                        )
+                    except Exception:
+                        user_input = None
+
+                    next_state = dict(event)
+                    next_state["pending_user_question"] = None
+                    if user_input and user_input.strip().lower() not in ("继续", "continue", "go on"):
+                        next_state["user_intervention"] = user_input
+                    else:
+                        next_state["phase"] = "discussion"
+                    _set_stream_queue(queue)
+                    await _resume_after_pause(next_state)
         except Exception as exc:
             logger.error("LangGraph discussion failed: %s", exc)
             graph_error = exc

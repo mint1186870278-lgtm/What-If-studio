@@ -48,8 +48,11 @@ async function parseApiError(res, fallbackMessage) {
   return fallbackMessage;
 }
 
-export async function streamProjectDiscussion(projectId, onTurn) {
-  const res = await fetch(joinApiUrl(`/api/projects/${projectId}/script/stream`), {
+export async function streamProjectDiscussion(projectId, onTurn, { userId } = {}) {
+  const params = new URLSearchParams();
+  if (userId) params.set("user_id", userId);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(joinApiUrl(`/api/projects/${projectId}/script/stream${query}`), {
     method: "POST",
     headers: { "Content-Type": "application/json" }
   });
@@ -161,4 +164,126 @@ export async function updateProject(projectId, payload) {
   });
   if (!res.ok) throw new Error(await parseApiError(res, "工程更新失败"));
   return res.json();
+}
+
+// -------------------------------------------------------------------------
+// WebSocket for real-time intervention
+// -------------------------------------------------------------------------
+
+let wsIntervention = null;
+let wsInterventionCallbacks = {};
+
+export function connectInterventionWebSocket(sessionId, callbacks = {}) {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.host || "localhost:8010";
+  const url = `${proto}//${host}/ws/${sessionId}`;
+  wsInterventionCallbacks = callbacks;
+  try {
+    wsIntervention = new WebSocket(url);
+  } catch (e) {
+    console.warn("WebSocket creation failed:", e);
+    return null;
+  }
+  wsIntervention.onopen = () => callbacks.onOpen?.();
+  wsIntervention.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      callbacks.onMessage?.(msg);
+    } catch {}
+  };
+  wsIntervention.onerror = (e) => callbacks.onError?.(e);
+  wsIntervention.onclose = (e) => callbacks.onClose?.(e);
+  return wsIntervention;
+}
+
+export function sendIntervene(sessionId, text) {
+  if (wsIntervention && wsIntervention.readyState === WebSocket.OPEN) {
+    wsIntervention.send(JSON.stringify({ action: "intervene", text }));
+    return true;
+  }
+  // REST fallback
+  fetch(joinApiUrl(`/api/sessions/${sessionId}/intervene`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  }).catch(() => {});
+  return false;
+}
+
+export function sendPause(sessionId) {
+  if (wsIntervention && wsIntervention.readyState === WebSocket.OPEN) {
+    wsIntervention.send(JSON.stringify({ action: "pause_now" }));
+  }
+}
+
+export function sendResume(sessionId) {
+  if (wsIntervention && wsIntervention.readyState === WebSocket.OPEN) {
+    wsIntervention.send(JSON.stringify({ action: "resume_now" }));
+  }
+}
+
+export function closeInterventionWebSocket() {
+  if (wsIntervention) {
+    try { wsIntervention.close(); } catch {}
+    wsIntervention = null;
+  }
+}
+
+// -------------------------------------------------------------------------
+// Output format selection
+// -------------------------------------------------------------------------
+
+export async function selectOutputFormat(projectId, outputType) {
+  const res = await fetch(joinApiUrl(`/api/projects/${projectId}/output/select`), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ output_type: outputType }),
+  });
+  if (!res.ok) throw new Error(await parseApiError(res, "输出格式设置失败"));
+  return res.json();
+}
+
+// -------------------------------------------------------------------------
+// Storyboard
+// -------------------------------------------------------------------------
+
+export async function generateStoryboard(projectId) {
+  const res = await fetch(joinApiUrl(`/api/projects/${projectId}/storyboard/generate`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.ok) throw new Error(await parseApiError(res, "分镜生成失败"));
+  return res.json();
+}
+
+export async function confirmStoryboard(projectId, confirmed, feedback) {
+  const res = await fetch(joinApiUrl(`/api/projects/${projectId}/storyboard/confirm`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmed, feedback: feedback || null }),
+  });
+  if (!res.ok) throw new Error(await parseApiError(res, "分镜确认失败"));
+  return res.json();
+}
+
+// -------------------------------------------------------------------------
+// Feedback
+// -------------------------------------------------------------------------
+
+export async function submitFeedback(payload) {
+  const res = await fetch(joinApiUrl("/api/feedback"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(await parseApiError(res, "反馈提交失败"));
+  return res.json();
+}
+
+// -------------------------------------------------------------------------
+// Script export
+// -------------------------------------------------------------------------
+
+export function getScriptExportUrl(projectId, format) {
+  return joinApiUrl(`/api/projects/${projectId}/script/export?format=${encodeURIComponent(format || "markdown")}`);
 }

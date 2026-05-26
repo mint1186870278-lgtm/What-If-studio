@@ -57,4 +57,8 @@ tmp-artifacts
 web/node_modules/
 web/dist/
 
+storage/.claude/
+project.txt
+
+.claude/
 storage/

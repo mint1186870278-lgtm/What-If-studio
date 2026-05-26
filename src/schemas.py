@@ -23,6 +23,7 @@ class ProjectUpdate(BaseModel):
     description: Optional[str] = None
     prompt: Optional[str] = None
     style_preference: Optional[str] = None
+    output_type: Optional[str] = None
 
 
 class ProjectResponse(BaseModel):
@@ -36,6 +37,8 @@ class ProjectResponse(BaseModel):
     script: Optional[str]
     discussion_history: List[Any]
     discussion_status: str
+    output_type: str
+    storyboard: Optional[dict] = None
     last_opened_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
@@ -167,3 +170,70 @@ class GatewayService(BaseModel):
     endpoint: str
     status: str  # 'active', 'inactive'
     tags: List[str]
+
+
+# Feedback schemas
+class FeedbackRequest(BaseModel):
+    """Explicit user feedback on a discussion/script"""
+
+    session_id: Optional[str] = None
+    project_id: Optional[str] = None
+    user_id: Optional[str] = None
+    rating: int = Field(..., ge=1, le=5)
+    comments: Optional[str] = None
+    liked_aspects: List[str] = Field(default_factory=list)
+    disliked_aspects: List[str] = Field(default_factory=list)
+
+
+class FeedbackResponse(BaseModel):
+    """Feedback acknowledgement"""
+
+    status: str = "ok"
+    message: str
+    feedback_id: Optional[str] = None
+
+
+# Output format selection
+class OutputSelectRequest(BaseModel):
+    """Request to set project output format preference"""
+
+    output_type: str = Field(..., pattern=r"^(script_only|script_and_storyboard|script_and_video)$")
+
+
+class StoryboardGenerateResponse(BaseModel):
+    """Storyboard generation response"""
+
+    project_id: str
+    frames: list[dict]
+    total_duration: str
+    generated_at: Optional[datetime] = None
+
+
+class StoryboardConfirmRequest(BaseModel):
+    """Confirm or reject a storyboard"""
+
+    confirmed: bool
+    feedback: Optional[str] = None
+
+
+class StoryboardConfirmResponse(BaseModel):
+    """Response after storyboard confirmation"""
+
+    status: str
+    message: str
+    job: Optional[dict] = None
+    storyboard: Optional[dict] = None
+
+
+class ScriptExportResponse(BaseModel):
+    """Script export response"""
+
+    project_id: str
+    format: str
+    content: str
+
+
+class InterveneRequest(BaseModel):
+    """Request to inject user intervention via REST"""
+
+    text: str

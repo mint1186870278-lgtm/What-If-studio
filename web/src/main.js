@@ -9,7 +9,16 @@ import {
   streamProjectDiscussion,
   uploadVideoSource,
   updateProject,
-  watchVideoJob
+  watchVideoJob,
+  connectInterventionWebSocket,
+  closeInterventionWebSocket,
+  sendIntervene,
+  sendPause,
+  sendResume,
+  selectOutputFormat,
+  generateStoryboard,
+  confirmStoryboard,
+  getScriptExportUrl,
 } from "./api";
 import { getDisplayName } from "./displayNames";
 import { createIdleDialogueEngine } from "./idleDialogueEngine";
@@ -34,6 +43,10 @@ app.innerHTML = `
         </div>
         <h1>意难平剧组</h1>
         <p class="card-summary">无限画布浏览模式已开启，可先逛房间再开机。</p>
+        <div id="memory-badge" class="memory-badge is-hidden">
+          <span class="memory-badge-icon">🧠</span>
+          <span id="memory-badge-text">记忆已加载</span>
+        </div>
         <label class="field-label" for="work-title">作品名称</label>
         <input id="work-title" name="workTitle" placeholder="例如：哈利波特与凤凰社" required />
 
@@ -95,6 +108,11 @@ app.innerHTML = `
           <span data-phase="deliver">deliver</span>
         </div>
         <div class="live-feed" id="live-feed"></div>
+        <div id="intervene-bar" class="intervene-bar is-hidden">
+          <input type="text" id="intervene-input" class="intervene-input" placeholder="随时输入你的想法注入讨论..." />
+          <button type="button" id="intervene-send-btn" class="intervene-send-btn">发送</button>
+          <button type="button" id="intervene-pause-btn" class="intervene-pause-btn">暂停</button>
+        </div>
       </div>
 
       <div id="spotlight-card" class="spotlight-card">
@@ -160,9 +178,33 @@ app.innerHTML = `
             <div id="script-review-progress" class="result-note-text">等待生成</div>
           </div>
           <div id="script-review-video" class="result-media is-hidden"></div>
+          <div class="result-notes" id="output-format-section">
+            <div class="result-notes-head">OUTPUT MODE</div>
+            <div class="output-format-options">
+              <label class="output-format-option">
+                <input type="radio" name="output-type" value="script_only" checked />
+                <span>仅剧本</span>
+              </label>
+              <label class="output-format-option">
+                <input type="radio" name="output-type" value="script_and_storyboard" />
+                <span>剧本 + 分镜预览</span>
+              </label>
+              <label class="output-format-option">
+                <input type="radio" name="output-type" value="script_and_video" />
+                <span>剧本 + 视频</span>
+              </label>
+            </div>
+            <div id="storyboard-preview" class="storyboard-preview is-hidden"></div>
+            <div class="storyboard-actions is-hidden" id="storyboard-actions">
+              <button type="button" id="storyboard-confirm-btn" class="result-primary-btn">确认分镜，生成视频</button>
+              <input type="text" id="storyboard-feedback" class="intervene-input" placeholder="调整意见（可选）" style="margin-top:8px;" />
+            </div>
+          </div>
           <footer class="result-actions">
-            <div class="result-actions-left"></div>
-            <button type="button" id="script-review-generate-btn" class="result-primary-btn">确认并生成视频</button>
+            <div class="result-actions-left">
+              <a id="script-export-link" class="ghost-btn" href="#" style="display:none;">导出剧本</a>
+            </div>
+            <button type="button" id="script-review-generate-btn" class="result-primary-btn">确认并继续</button>
           </footer>
         </article>
       </section>
@@ -211,8 +253,39 @@ const scriptReviewGenerateBtn = document.querySelector("#script-review-generate-
 const scriptReviewContent = document.querySelector("#script-review-content");
 const scriptReviewProgress = document.querySelector("#script-review-progress");
 const scriptReviewVideo = document.querySelector("#script-review-video");
+const interveneBar = document.querySelector("#intervene-bar");
+const interveneInput = document.querySelector("#intervene-input");
+const interveneSendBtn = document.querySelector("#intervene-send-btn");
+const intervenePauseBtn = document.querySelector("#intervene-pause-btn");
+const storyboardPreview = document.querySelector("#storyboard-preview");
+const storyboardActions = document.querySelector("#storyboard-actions");
+const storyboardConfirmBtn = document.querySelector("#storyboard-confirm-btn");
+const storyboardFeedback = document.querySelector("#storyboard-feedback");
+const scriptExportLink = document.querySelector("#script-export-link");
+const outputFormatRadios = document.querySelectorAll("input[name=\"output-type\"]");
+const memoryBadge = document.querySelector("#memory-badge");
+const memoryBadgeText = document.querySelector("#memory-badge-text");
+
+// --- User identity for cross-session memory ---
+function getUserId() {
+  const stored = window.localStorage.getItem("whatif_user_id");
+  if (stored) return stored;
+  const id = "user_" + Math.random().toString(36).slice(2, 10);
+  window.localStorage.setItem("whatif_user_id", id);
+  return id;
+}
+
+function getUserMemorySummary() {
+  try { return JSON.parse(window.localStorage.getItem("whatif_memory_summary") || "{}"); } catch { return {}; }
+}
+function setUserMemorySummary(summary) {
+  window.localStorage.setItem("whatif_memory_summary", JSON.stringify(summary));
+}
 
 let networkHandle;
+let wsSessionId = null;
+let isPaused = false;
+let outputTypeSelected = "script_only";
 let unsubscribeJob = null;
 let spotlightTimer = null;
 let spotlightPinned = false;
@@ -270,12 +343,21 @@ async function loadProjectFromQuery() {
 function openScriptReview(scriptText) {
   scriptReviewOpenedAtMs = Date.now();
   scriptReviewContent.textContent = scriptText || "暂无脚本";
-  scriptReviewProgress.textContent = "讨论完成，等待确认生成视频";
+  scriptReviewProgress.textContent = "讨论完成，请选择输出模式";
   scriptReviewVideo.classList.add("is-hidden");
   scriptReviewVideo.innerHTML = "";
   scriptReviewGenerateBtn.classList.remove("is-hidden");
   scriptReviewGenerateBtn.disabled = false;
+  scriptReviewGenerateBtn.textContent = "确认并继续";
   scriptReviewOverlay.classList.remove("is-hidden");
+  // Reset output format UI
+  storyboardPreview.classList.add("is-hidden");
+  storyboardPreview.innerHTML = "";
+  storyboardActions.classList.add("is-hidden");
+  scriptExportLink.style.display = "none";
+  const radio = document.querySelector("input[name=\"output-type\"][value=\"script_only\"]");
+  if (radio) radio.checked = true;
+  outputTypeSelected = "script_only";
 }
 
 function closeScriptReview() {
@@ -285,17 +367,38 @@ function closeScriptReview() {
 function waitForGenerateConfirm() {
   return new Promise((resolve, reject) => {
     const onConfirm = () => {
+      // Read selected output type
+      const checked = document.querySelector("input[name=\"output-type\"]:checked");
+      outputTypeSelected = checked ? checked.value : "script_only";
       cleanup();
-      resolve(true);
+      resolve(outputTypeSelected);  // resolve with the selected output type
     };
     const onClose = () => {
       cleanup();
       closeScriptReview();
       reject(new Error("已取消生成"));
     };
+    // Also listen to radio changes
+    const onRadioChange = () => {
+      const checked = document.querySelector("input[name=\"output-type\"]:checked");
+      outputTypeSelected = checked ? checked.value : "script_only";
+      if (outputTypeSelected === "script_only") {
+        scriptReviewGenerateBtn.textContent = "仅导出剧本";
+      } else if (outputTypeSelected === "script_and_storyboard") {
+        scriptReviewGenerateBtn.textContent = "生成分镜预览";
+      } else {
+        scriptReviewGenerateBtn.textContent = "确认并生成视频";
+      }
+    };
+    for (const r of outputFormatRadios) {
+      r.addEventListener("change", onRadioChange);
+    }
     function cleanup() {
       scriptReviewGenerateBtn.removeEventListener("click", onConfirm);
       scriptReviewCloseBtn.removeEventListener("click", onClose);
+      for (const r of outputFormatRadios) {
+        r.removeEventListener("change", onRadioChange);
+      }
     }
     scriptReviewGenerateBtn.addEventListener("click", onConfirm);
     scriptReviewCloseBtn.addEventListener("click", onClose);
@@ -690,6 +793,12 @@ function openLive(question) {
   lastPhaseSection = "";
   ensureDiscussionSection("briefing");
   renderSystemLine("导演组就位，讨论系统启动。");
+  // Show intervention bar
+  interveneBar.classList.remove("is-hidden");
+  interveneInput.disabled = false;
+  intervenePauseBtn.textContent = "暂停";
+  intervenePauseBtn.style.background = "";
+  isPaused = false;
 }
 
 function closeLive() {
@@ -701,6 +810,11 @@ function closeLive() {
   queueText.textContent = "STANDBY";
   clearStreamRetryAction();
   networkHandle?.setIdleSpeechEnabled(false);
+  // Hide intervention bar
+  interveneBar.classList.add("is-hidden");
+  closeInterventionWebSocket();
+  wsSessionId = null;
+  isPaused = false;
 }
 
 function hideResultOverlay() {
@@ -964,6 +1078,46 @@ retryStreamBtn.addEventListener("click", async () => {
   }
 });
 
+// --- Intervention bar events ---
+interveneSendBtn.addEventListener("click", async () => {
+  const text = interveneInput.value.trim();
+  if (!text || !wsSessionId) return;
+  interveneInput.value = "";
+  const sent = sendIntervene(wsSessionId, text);
+  if (sent) {
+    renderMessageLine("user", text);
+    latestDiscussionTranscript.push(`用户：${text}`);
+  } else {
+    renderSystemLine("（已通过 HTTP 发送干预意见，将在下一轮讨论中生效）");
+  }
+});
+
+interveneInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    interveneSendBtn.click();
+  }
+});
+
+intervenePauseBtn.addEventListener("click", () => {
+  if (!wsSessionId) return;
+  if (isPaused) {
+    sendResume(wsSessionId);
+    intervenePauseBtn.textContent = "暂停";
+    intervenePauseBtn.style.background = "";
+    queueText.textContent = "LIVE";
+    renderSystemLine("讨论已恢复。");
+    isPaused = false;
+  } else {
+    sendPause(wsSessionId);
+    intervenePauseBtn.textContent = "继续";
+    intervenePauseBtn.style.background = "#c9a84c";
+    queueText.textContent = "PAUSED";
+    renderSystemLine("讨论已暂停，点击「继续」或发送消息恢复。");
+    isPaused = true;
+  }
+});
+
 function phaseLabel(phase) {
   if (phase === "collect") return "collect";
   if (phase === "analyze") return "analyze";
@@ -1080,6 +1234,12 @@ async function bootstrap() {
   networkHandle.setIdleSpeechEnabled(false);
   startSpotlight();
   setRoleBuckets(createEmptyRoleBuckets());
+  // Show memory badge if we have stored preferences
+  const memSummary = getUserMemorySummary();
+  if (memSummary.preferences_count > 0) {
+    memoryBadgeText.textContent = `${memSummary.preferences_count} 条偏好已记住`;
+    memoryBadge.classList.remove("is-hidden");
+  }
   await loadProjectFromQuery();
 }
 
@@ -1155,6 +1315,24 @@ inputOverlay.addEventListener("submit", async (event) => {
       discussionPlaybackQueue = [];
       discussionPlaybackDone = false;
       const playbackTask = replayDiscussionEvents();
+      // Open WebSocket for intervention
+      wsSessionId = activeProjectId;
+      connectInterventionWebSocket(activeProjectId, {
+        onOpen: () => console.log("[ws] intervention channel open"),
+        onMessage: (msg) => {
+          if (msg.type === "paused") renderSystemLine("（讨论已暂停）");
+          if (msg.type === "resumed") renderSystemLine("（讨论已恢复）");
+          if (msg.type === "question") {
+            renderSystemLine(`🟡 ${msg.question || "导演组需要你的意见"}`);
+            interveneInput.focus();
+          }
+          if (msg.type === "ack" && msg.action === "intervene") {
+            renderSystemLine("（你的意见已注入讨论）");
+          }
+        },
+        onClose: () => console.log("[ws] intervention channel closed"),
+      });
+      const currentUserId = getUserId();
       await streamProjectDiscussion(activeProjectId, (turn) => {
         if (turn.type === "error" || turn.event === "error") {
           playbackError = new Error(String(turn.message || turn.error || "讨论失败"));
@@ -1164,8 +1342,30 @@ inputOverlay.addEventListener("submit", async (event) => {
           latestGeneratedScript = String(turn.script || "");
           return;
         }
+        // Handle new SSE event types from backend
+        if (turn.type === "awaiting_input") {
+          // Question rendered via WS "question" message instead (no duplicate)
+          return;
+        }
+        if (turn.type === "user_intervention") {
+          renderMessageLine("user", turn.content || "");
+          return;
+        }
+        if (turn.type === "memory_loaded") {
+          if (turn.preferences_count > 0 || turn.similar_scripts > 0) {
+            const msg = `🧠 记忆系统已加载：${turn.preferences_count} 条偏好，${turn.similar_scripts} 个相似历史剧本`;
+            renderSystemLine(msg);
+            setUserMemorySummary({
+              preferences_count: turn.preferences_count,
+              similar_scripts: turn.similar_scripts,
+              lastLoaded: new Date().toISOString(),
+              userId: currentUserId,
+            });
+          }
+          return;
+        }
         discussionPlaybackQueue.push(turn);
-      });
+      }, { userId: currentUserId });
       discussionPlaybackDone = true;
       await playbackTask;
       if (playbackError) throw playbackError;
@@ -1184,8 +1384,74 @@ inputOverlay.addEventListener("submit", async (event) => {
       throw new Error("讨论未产出可用剧本，请检查 OPENAI 配置或模型响应。");
     }
     openScriptReview(latestGeneratedScript);
-    await waitForGenerateConfirm();
+    const chosenOutput = await waitForGenerateConfirm();
     scriptReviewGenerateBtn.disabled = true;
+
+    // Save output format preference
+    try { await selectOutputFormat(activeProjectId, chosenOutput); } catch {}
+
+    // --- Handle "script_only" ---
+    if (chosenOutput === "script_only") {
+      scriptReviewProgress.textContent = "剧本已生成，点击下方链接下载";
+      scriptExportLink.style.display = "inline-block";
+      scriptExportLink.href = getScriptExportUrl(activeProjectId, "markdown");
+      scriptExportLink.textContent = "下载 Markdown 剧本";
+      scriptReviewGenerateBtn.classList.add("is-hidden");
+      closeInterventionWebSocket();
+      return;
+    }
+
+    // --- Handle "script_and_storyboard" ---
+    if (chosenOutput === "script_and_storyboard") {
+      scriptReviewProgress.textContent = "分镜预览生成中…";
+      try {
+        const sb = await generateStoryboard(activeProjectId);
+        const frames = sb.frames || [];
+        storyboardPreview.classList.remove("is-hidden");
+        storyboardPreview.innerHTML = frames.map((f, i) => `
+          <div class="storyboard-frame">
+            <strong>第${i + 1}幕 (${f.timing || "?"})</strong>
+            <p>${escapeHtml(f.description || "")}</p>
+            ${f.visual_prompt ? `<small>视觉提示: ${escapeHtml(f.visual_prompt)}</small>` : ""}
+          </div>
+        `).join("");
+        storyboardActions.classList.remove("is-hidden");
+        scriptReviewGenerateBtn.classList.add("is-hidden");
+        scriptReviewProgress.textContent = `分镜预览共 ${frames.length} 帧 — 确认后生成视频？`;
+        // Wait for storyboard confirm → then ask "generate video?"
+        await new Promise((resolveSb, rejectSb) => {
+          storyboardConfirmBtn.addEventListener("click", async () => {
+            storyboardConfirmBtn.disabled = true;
+            const fb = storyboardFeedback.value.trim();
+            try {
+              await confirmStoryboard(activeProjectId, true, fb || undefined);
+              resolveSb(true);
+            } catch (e) { rejectSb(e); }
+          }, { once: true });
+        });
+        // Ask: generate video now?
+        storyboardActions.classList.add("is-hidden");
+        scriptReviewGenerateBtn.classList.remove("is-hidden");
+        scriptReviewGenerateBtn.textContent = "生成视频";
+        scriptReviewGenerateBtn.disabled = false;
+        scriptReviewProgress.textContent = "分镜已确认。是否生成视频？";
+        const proceed = await waitForGenerateConfirm();
+        if (proceed === "script_only") {
+          // User closed instead of generating video
+          scriptReviewGenerateBtn.classList.add("is-hidden");
+          closeInterventionWebSocket();
+          return;
+        }
+        // Fall through to video generation below
+      } catch (e) {
+        scriptReviewProgress.textContent = `分镜生成失败：${e.message}`;
+        scriptReviewGenerateBtn.classList.remove("is-hidden");
+        scriptReviewGenerateBtn.disabled = false;
+        return;
+      }
+    }
+
+    // --- Video generation (for "script_and_video" or "script_and_storyboard" after confirm) ---
     scriptReviewProgress.textContent = "视频任务创建中…";
 
     // Upload source video (required for HappyHorse)

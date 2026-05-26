@@ -136,8 +136,12 @@ class MemoryService:
             import chromadb
             persist = settings.chroma_persist_path
             Path(persist).mkdir(parents=True, exist_ok=True)
-            self._chroma = chromadb.PersistentClient(path=persist)
-            self._collection = self._chroma.get_or_create_collection(
+            # Run in thread to prevent ONNX model download from blocking event loop
+            self._chroma = await asyncio.to_thread(
+                chromadb.PersistentClient, path=persist,
+            )
+            self._collection = await asyncio.to_thread(
+                self._chroma.get_or_create_collection,
                 name="scripts",
                 metadata={"hnsw:space": "cosine"},
             )
@@ -263,11 +267,18 @@ class MemoryService:
 
     # -- Context builder ------------------------------------------------------
 
-    async def build_context_for_new_session(self, user_id: str, current_prompt: str) -> str:
-        """Build a context string to inject into a new discussion."""
+    async def build_context_for_new_session(self, user_id: str, current_prompt: str) -> dict:
+        """Build a context string to inject into a new discussion.
+
+        Returns a dict with keys: context (str), preferences_count (int), similar_scripts (int).
+
+        Only uses fast JSON preferences — Chroma vector search is deferred to
+        post-discussion storage to avoid blocking the SSE stream on model download.
+        """
         parts: list[str] = []
 
         prefs = await self.get_user_preferences(user_id)
+        preferences_count = len(prefs)
         if prefs:
             parts.append("## 用户历史偏好")
             for p in prefs[-10:]:
@@ -275,7 +286,10 @@ class MemoryService:
                 if val:
                     parts.append(f"- {str(val)[:200]}")
 
-        similar = await self.search_similar_scripts(current_prompt, k=2)
+        # Use TF-IDF fallback search (fast, no ONNX download needed).
+        # Chroma is used only for post-discussion storage (off hot path).
+        similar = await self._search_tfidf(current_prompt, k=2)
+        similar_scripts_count = len(similar)
         if similar:
             parts.append("## 历史相关剧本参考")
             for s in similar:
@@ -283,7 +297,12 @@ class MemoryService:
                 style = meta.get("style", "")
                 parts.append(f"- [{style}] {s.get('script', '')[:300]}")
 
-        return "\n".join(parts) if parts else ""
+        context_str = "\n".join(parts) if parts else ""
+        return {
+            "context": context_str,
+            "preferences_count": preferences_count,
+            "similar_scripts": similar_scripts_count,
+        }
 
     # -- Feedback -------------------------------------------------------------
 
@@ -296,6 +315,25 @@ class MemoryService:
             "confidence": 90,
         })
         logger.info("Recorded feedback for user %s on script %s", user_id, script_id)
+
+
+def detect_script_tone(script: str) -> str:
+    """Detect the dominant tone/genre from a generated script."""
+    script_lower = script.lower()
+    tones = {
+        "comedy": ["搞笑", "幽默", "喜剧", "笑话", "funny", "comedy", "轻松"],
+        "dramatic": ["紧张", "悬疑", "冲突", "矛盾", "dramatic", "tense", "压抑"],
+        "romantic": ["爱情", "浪漫", "恋爱", "romantic", "love", "温馨"],
+        "action": ["动作", "打斗", "战斗", "action", "fight", "激烈"],
+        "horror": ["恐怖", "惊悚", "horror", "scary", "诡异"],
+        "fantasy": ["奇幻", "魔法", "fantasy", "magic", "神话"],
+        "tragedy": ["悲剧", "牺牲", "死亡", "tragedy", "离别"],
+        "slice_of_life": ["日常", "平淡", "生活", "温馨", "治愈"],
+    }
+    for tone, keywords in tones.items():
+        if any(kw in script_lower for kw in keywords):
+            return tone
+    return "narrative"
 
 
 def _safe_filename(s: str) -> str:

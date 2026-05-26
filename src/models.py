@@ -23,6 +23,8 @@ class Project(Base):
     script = Column(Text, nullable=True)
     discussion_history = Column(JSON, default=list, nullable=False)
     discussion_status = Column(String(50), default="idle", nullable=False)
+    output_type = Column(String(50), default="script_only", nullable=False)
+    storyboard = Column(JSON, default=None, nullable=True)
     last_opened_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

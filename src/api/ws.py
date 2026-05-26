@@ -21,6 +21,17 @@ active_connections: dict[str, WebSocket] = {}
 pending_inputs: dict[str, asyncio.Event] = {}
 pending_input_values: dict[str, str] = {}
 
+# ---------------------------------------------------------------------------
+# True real-time intervention -- signals graph nodes to pick up user input
+# at any time, not just during the "awaiting_user" phase.
+# ---------------------------------------------------------------------------
+
+intervention_flags: dict[str, asyncio.Event] = {}
+intervention_texts: dict[str, str] = {}
+
+# Pause / resume at any node boundary
+pause_events: dict[str, asyncio.Event] = {}
+
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
@@ -46,18 +57,42 @@ async def discussion_websocket(websocket: WebSocket, session_id: str):
 
             if action == "intervene":
                 user_text = str(message.get("text", ""))
+
+                # Legacy pathway: unblock wait_for_user_input (awaiting_user phase)
                 pending_input_values[session_id] = user_text
                 event = pending_inputs.get(session_id)
                 if event:
                     event.set()
+
+                # New pathway: real-time async intervention at any node boundary
+                intervention_texts[session_id] = user_text
+                flag = intervention_flags.get(session_id)
+                if flag is None:
+                    flag = asyncio.Event()
+                    intervention_flags[session_id] = flag
+                flag.set()
+
+                # Auto-resume if currently paused
+                pause_evt = pause_events.get(session_id)
+                if pause_evt is not None:
+                    pause_evt.set()
+
                 await websocket.send_json({"type": "ack", "action": "intervene"})
                 logger.info("User intervention for session %s: %s", session_id, user_text[:80])
 
-            elif action == "pause":
+            elif action == "pause_now":
+                # Create a pause Event in the CLEARED state -- nodes will block on it
+                if session_id not in pause_events:
+                    pause_events[session_id] = asyncio.Event()
                 await websocket.send_json({"type": "paused", "session_id": session_id})
+                logger.info("Pause requested for session %s", session_id)
 
-            elif action == "resume":
+            elif action == "resume_now":
+                evt = pause_events.get(session_id)
+                if evt is not None:
+                    evt.set()
                 await websocket.send_json({"type": "resumed", "session_id": session_id})
+                logger.info("Resume triggered for session %s", session_id)
 
             elif action == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -73,6 +108,9 @@ async def discussion_websocket(websocket: WebSocket, session_id: str):
         active_connections.pop(session_id, None)
         pending_inputs.pop(session_id, None)
         pending_input_values.pop(session_id, None)
+        intervention_flags.pop(session_id, None)
+        intervention_texts.pop(session_id, None)
+        pause_events.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
